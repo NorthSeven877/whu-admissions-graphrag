@@ -22,6 +22,9 @@ from pydantic import BaseModel
 DATA = os.environ.get("WHU_DATA", "/opt/whu/data")
 LLM_URL = os.environ.get("WHU_LLM", "http://127.0.0.1:8082/v1/chat/completions")
 LLM_MODEL = os.environ.get("WHU_LLM_MODEL", "qwen2.5-1.5b-instruct")
+LLM_API_KEY = os.environ.get("WHU_LLM_API_KEY", "")
+LLM_VERIFY_SSL = os.environ.get("WHU_LLM_VERIFY_SSL", "true").lower() != "false"
+EMBED_MODEL = os.environ.get("WHU_EMBED_MODEL", "BAAI/bge-small-zh-v1.5")
 TOP_DOCS = 3
 CHUNK_CHARS = 600
 
@@ -66,7 +69,9 @@ def load_resources():
     by_doc = {}
     for i, ch in enumerate(chunks):
         by_doc.setdefault(ch["doc_id"], []).append(i)
+    doc_indices.clear()
     doc_indices.update(by_doc)
+    doc_meta.clear()
 
     by_doc_ch = {}
     for ch in chunks:
@@ -85,12 +90,14 @@ def load_resources():
     npy = os.path.join(DATA, "embeddings.npy")
     if os.path.exists(npy):
         embeddings = np.load(npy)
+        if embeddings.shape[0] != len(chunks):
+            raise ValueError("Vector index and chunks differ; rebuild the GraphRAG index.")
         try:
             import torch
             from transformers import AutoModel, AutoTokenizer
             os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
-            emb_tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-small-zh-v1.5")
-            emb_model = AutoModel.from_pretrained("BAAI/bge-small-zh-v1.5")
+            emb_tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL)
+            emb_model = AutoModel.from_pretrained(EMBED_MODEL)
             emb_model.eval()
         except Exception as e:
             print("warn: embedding model unavailable: %s" % e, file=sys.stderr)
@@ -135,7 +142,7 @@ def graph_match(query):
     docs = {}
     for e in hit:
         docs[e] = {r[0] for r in cur.execute(
-            "SELECT DISTINCT doc_id FROM mentions WHERE entity=? LIMIT 80", (e,))}
+            "SELECT DISTINCT doc_id FROM mentions WHERE entity=?", (e,))}
     conn.close()
     return hit, docs
 
@@ -151,6 +158,7 @@ def retrieve(query):
     intro_query = any(w in query for w in INTRO_WORDS)
     wants_list = any(w in query for w in ("哪些", "什么专业", "专业", "名单", "目录"))
     years = re.findall(r"20\d{2}", query)
+    wants_formula = "综合成绩" in query and any(w in query for w in ("计算", "合成", "怎么", "如何", "比例"))
 
     # 本科 / 研究生 范围先验：招生问答里最有效的一个判断
     undergrad_words = ("本科", "高考", "保送", "强基", "艺术类", "高水平", "自主招生",
@@ -219,6 +227,11 @@ def retrieve(query):
     for d in list(doc_best):
         m = doc_meta.get(d, {})
         s = doc_best[d]
+        if wants_formula and any(
+            re.search(r"综合成绩\s*[=＝]", chunks[i]["text"])
+            for i in doc_indices[d]
+        ):
+            s *= 3
         if m.get("is_listing"):
             s *= 0.30
         if urlparse(m.get("url", "")).path in ("", "/"):
@@ -268,7 +281,17 @@ def retrieve(query):
         if intro:
             doc_best = intro
 
-    ranked = sorted(doc_best.items(), key=lambda kv: kv[1], reverse=True)[:TOP_DOCS]
+    ranked = []
+    seen_sources = set()
+    for doc_id, score in sorted(doc_best.items(), key=lambda kv: kv[1], reverse=True):
+        meta = doc_meta[doc_id]
+        source_key = meta["url"] or (meta["title"], meta["date"])
+        if source_key in seen_sources:
+            continue
+        seen_sources.add(source_key)
+        ranked.append((doc_id, score))
+        if len(ranked) == TOP_DOCS:
+            break
     out = []
     for rank, (d, sc) in enumerate(ranked):
         idx = doc_chunk[d]
@@ -277,6 +300,9 @@ def retrieve(query):
             # 首篇文档取“最相关的 3 段”拼起来，清单类内容不会因为只取开头而漏项
             idxs = doc_indices.get(d, [idx])
             top = sorted(idxs, key=lambda i: (bm[i] / bmax + sims[i] / smax), reverse=True)[:3]
+            if wants_formula:
+                formula = [i for i in idxs if re.search(r"综合成绩\s*[=＝]", chunks[i]["text"])]
+                top = list(dict.fromkeys(formula[:1] + top))[:3]
             joined = "\n".join(chunks[i]["text"] for i in sorted(top))
             c["text"] = joined[:1600]
         else:
@@ -307,6 +333,12 @@ class ChatReq(BaseModel):
     history: list = []
 
 
+@app.post("/api/retrieve")
+def retrieve_documents(req: ChatReq):
+    context, entities = retrieve(req.query)
+    return {"documents": context, "entities": entities}
+
+
 @app.post("/api/chat")
 def chat(req: ChatReq):
     ctx, ents = retrieve(req.query)
@@ -334,7 +366,11 @@ def chat(req: ChatReq):
                    "presence_penalty": 0.2,
                    "stop": ["【资料", "\n问题：", "\n\n资料："]}
         try:
-            with requests.post(LLM_URL, json=payload, stream=True, timeout=900) as r:
+            headers = {"Authorization": f"Bearer {LLM_API_KEY}"} if LLM_API_KEY else {}
+            if LLM_MODEL == "qwen3.6-a3b":
+                payload["chat_template_kwargs"] = {"enable_thinking": False}
+            with requests.post(LLM_URL, json=payload, headers=headers, stream=True,
+                               timeout=120, verify=LLM_VERIFY_SSL) as r:
                 r.raise_for_status()
                 for line in r.iter_lines(decode_unicode=False):
                     if not line or not line.startswith(b"data:"):
@@ -388,4 +424,5 @@ def index():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("WHU_PORT", "8090")), log_level="info")
+    uvicorn.run(app, host=os.environ.get("WHU_HOST", "127.0.0.1"),
+                port=int(os.environ.get("WHU_PORT", "8090")), log_level="info")

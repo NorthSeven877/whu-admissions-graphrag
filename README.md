@@ -4,6 +4,43 @@
 
 访问地址：**http://localhost:8090**
 
+## 与招生助手及 DB-GPT 的本机整合
+
+现有网页与微信小程序请求 DB-GPT 的 15670 端口。政策问题由 DB-GPT
+向本项目的 8090 端口请求图谱、BM25 和向量联合检索，再由 Qwen 生成答案。
+分数、位次和招生计划继续查询 PostgreSQL。回答末尾列出检索资料，
+网页点击出处可打开原文，小程序点击出处可复制链接。
+
+本次使用同级 doc 目录的 Markdown 文档建立索引。原作者 README 中的
+796 篇语料未附在仓库中，学院简介和研究生材料的覆盖需要后续导入原始
+pages.jsonl。导入程序只使用标题匹配的官网链接，未匹配到链接的资料显示标题和日期。
+
+首次建立本机索引，在本项目目录用 PowerShell 执行以下命令。
+若 data/pages.jsonl 已存在，直接从 build_index.py 开始执行。
+
+~~~powershell
+uv pip install --python ../DB-GPT/.venv/Scripts/python.exe jieba==0.42.1 rank-bm25==0.2.2
+$env:WHU_DATA = Join-Path (Get-Location) 'data'
+$env:WHU_EMBED_MODEL = Join-Path (Split-Path (Get-Location)) 'DB-GPT/models/bge-small-zh-v1.5'
+../DB-GPT/.venv/Scripts/python.exe app/import_local_docs.py
+../DB-GPT/.venv/Scripts/python.exe app/build_index.py
+~~~
+
+启动整合后的后端，在 PowerShell 执行以下命令。
+
+~~~powershell
+& 'D:\PhdCartoAgent\FreshmanAsk\招生智能体_后端部署包_20261112\scripts\start_local.ps1'
+~~~
+
+网页仍使用同级 whu-admission-assistant/miniapp 的 npm.cmd run dev:h5。
+模型使用部署包本地配置中的 qwen3.8-flash-next。检索服务读取 WHU_EMBED_MODEL
+指定的本地模型，鉴权读取 WHU_LLM_API_KEY。DB-GPT 通过
+WHU_GRAPH_RETRIEVE_URL 接入 POST /api/retrieve，返回 documents 和 entities。
+这些环境变量由启动脚本设置。
+
+整合涉及本项目的检索接口、DB-GPT 的招生知识库检索入口，以及原前端的问题
+路由和出处链接显示。重建索引后需重启 GraphRAG 服务。
+
 ---
 
 ## 一、系统构成

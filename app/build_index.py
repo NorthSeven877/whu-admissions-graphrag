@@ -117,7 +117,7 @@ def build_embeddings(chunks):
         return False
 
     os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
-    name = "BAAI/bge-small-zh-v1.5"
+    name = os.environ.get("WHU_EMBED_MODEL", "BAAI/bge-small-zh-v1.5")
     try:
         tok = AutoTokenizer.from_pretrained(name)
         model = AutoModel.from_pretrained(name)
